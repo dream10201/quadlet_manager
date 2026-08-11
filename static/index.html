@@ -46,6 +46,15 @@
             max-height: 260px; overflow-y: auto; }
   #toast { position: fixed; bottom: 16px; left: 16px; background: #262b33; border: 1px solid var(--border);
            border-radius: 8px; padding: 8px 14px; display: none; z-index: 20; max-width: 50%; }
+  #help { position: fixed; top: 46px; left: 12px; z-index: 15; display: none; max-width: 560px;
+          background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+          padding: 12px 16px; box-shadow: 0 8px 30px rgba(0,0,0,.5); }
+  #help dt { color: var(--accent); font-weight: 600; margin-top: 8px; }
+  #help dd { margin: 2px 0 0 0; color: var(--muted); font-size: 12.5px; }
+  .explain { background: #171b21; border-left: 3px solid var(--accent); border-radius: 4px;
+             padding: 6px 10px; margin: 4px 0; font-size: 12.5px; }
+  .explain b { color: var(--fg); }
+  .explain .warn { color: var(--yellow); }
   .legend { display: flex; gap: 14px; font-size: 12px; color: var(--muted); flex-wrap: wrap; }
   .legend span::before { content: "—— "; font-weight: bold; }
   .lg-req::before { color: var(--red); } .lg-partof::before { color: #b06fd8; }
@@ -60,6 +69,7 @@
   <button onclick="refresh(true)">刷新</button>
   <button onclick="post('api/daemon-reload').then(r=>toast('daemon-reload: '+(r.ok?'完成':r.error||r.message)))">daemon-reload</button>
   <label class="muted"><input type="checkbox" id="show-net" onchange="draw()" checked> 显示网络分组</label>
+  <button onclick="$('help').style.display = $('help').style.display === 'block' ? 'none' : 'block'" title="依赖指令说明">❓ 指令说明</button>
   <div class="legend">
     <span class="lg-req">Requires/BindsTo</span><span class="lg-partof">PartOf</span>
     <span class="lg-wants">Wants</span><span class="lg-after">After/Before</span><span class="lg-net">网络</span>
@@ -74,11 +84,41 @@
     <span class="badge b-other">切换中</span><br><br>
     箭头方向 A → B 表示 A 依赖 B（B 先启动）。拖动节点可以整理布局。</p></div>
 </div>
+<div id="help"></div>
 <div id="toast"></div>
 
 <script>
 let GRAPH = null, network = null, selected = null;
 const $ = id => document.getElementById(id);
+
+// 各依赖指令的含义（悬停提示 + 帮助面板共用）
+const DIR_HELP = {
+  Requires: "强依赖：启动本服务会一起启动它；它启动失败则本服务失败；它被停止时本服务也停止。注意它只管“要不要”，不管先后顺序，通常要配合 After 使用。",
+  Wants:    "弱依赖：启动本服务会顺带启动它，但它失败或不存在都不影响本服务。推荐的默认选择。",
+  BindsTo:  "最强依赖：它无论因何停止（包括崩溃退出），本服务都立刻停止。通常配合 After 使用。",
+  PartOf:   "单向联动：停止/重启它时，本服务也跟着停止/重启；反过来操作本服务不影响它。不影响启动，也不管顺序。",
+  After:    "只定顺序：如果两者都要启动，等它启动完成后才启动本服务。不会主动拉起它。",
+  Before:   "只定顺序：本服务先于它启动。不会主动拉起它。",
+};
+
+// 把某个目标服务上的一组指令翻译成一句人话
+function explainTarget(target, dirs) {
+  const name = target.replace(/\.service$/, "");
+  const has = d => dirs.includes(d);
+  const parts = [];
+  if (has("BindsTo"))       parts.push("启动时会拉起它，它一旦停止（含崩溃）本服务立刻停止");
+  else if (has("Requires")) parts.push("启动时会拉起它，它启动失败或被停止则本服务也失败/停止");
+  else if (has("Wants"))    parts.push("启动时会顺带拉起它（它失败不影响本服务）");
+  if (has("PartOf"))        parts.push("重启/停止它时本服务会跟着重启/停止");
+  if (has("After"))         parts.push("会等它启动完成后再启动");
+  if (has("Before"))        parts.push("本服务会先于它启动");
+  const warns = [];
+  if ((has("Requires") || has("Wants") || has("BindsTo")) && !has("After"))
+    warns.push("没配 After，可能在它就绪前就启动");
+  if (has("After") && !has("Requires") && !has("Wants") && !has("BindsTo") && !has("PartOf"))
+    warns.push("只排序，不会自动拉起它");
+  return { name, text: parts.join("；"), warns };
+}
 
 function toast(msg, ms = 3500) {
   const t = $("toast"); t.textContent = msg; t.style.display = "block";
@@ -188,18 +228,26 @@ function renderDetail() {
   const u = n.unit;
   const others = GRAPH.nodes.filter(x => x.id !== n.id).map(x => x.unit.service);
   const depRows = [];
+  const byTarget = {};
   for (const [dir, targets] of Object.entries(u.deps)) {
     for (const t of targets) {
-      depRows.push(`<div class="dep-row"><span class="t">${dir} → ${t}</span>
+      depRows.push(`<div class="dep-row"><span class="t" title="${DIR_HELP[dir] || ""}">${dir} → ${t}</span>
         <button class="danger" onclick="removeDep('${dir}','${t}')">删除</button></div>`);
+      if (t !== "network-online.target" && t !== "local-fs.target")
+        (byTarget[t] = byTarget[t] || []).push(dir);
     }
   }
+  const explains = Object.entries(byTarget).map(([t, dirs]) => {
+    const e = explainTarget(t, dirs);
+    return `<div class="explain"><b>${e.name}</b>：${e.text || "（无启动/联动语义）"}` +
+      (e.warns.length ? `<div class="warn">⚠ ${e.warns.join("；")}</div>` : "") + `</div>`;
+  });
   const dependents = [];
   for (const other of GRAPH.nodes) {
     if (other.id === n.id) continue;
     for (const [dir, targets] of Object.entries(other.unit.deps))
       if (targets.includes(u.service))
-        dependents.push(`<div class="dep-row"><span class="t">${other.id.replace(".container","")} (${dir})</span></div>`);
+        dependents.push(`<div class="dep-row"><span class="t" title="${DIR_HELP[dir] || ""}">${other.id.replace(".container","")} (${dir})</span></div>`);
   }
   $("detail").innerHTML = `
     <h2 style="margin-top:36px">${u.container_name || n.id}</h2>
@@ -218,9 +266,10 @@ function renderDetail() {
     <h2>依赖（本单元 → 其他）</h2>
     ${depRows.join("") || '<div class="muted">无</div>'}
     ${n.external_deps.length ? '<div class="muted" style="margin-top:4px">外部: ' + n.external_deps.join("; ") + "</div>" : ""}
+    ${explains.length ? '<h2>依赖解读</h2>' + explains.join("") : ""}
     <div class="row">
-      <select id="dep-dir">${["Requires","Wants","After","Before","BindsTo","PartOf"]
-        .map(d => `<option>${d}</option>`).join("")}</select>
+      <select id="dep-dir" title="悬停各选项或点顶部“❓ 指令说明”查看含义">${["Requires","Wants","After","Before","BindsTo","PartOf"]
+        .map(d => `<option title="${DIR_HELP[d]}">${d}</option>`).join("")}</select>
       <select id="dep-target">${others.map(s => `<option>${s}</option>`).join("")}</select>
       <button class="primary" onclick="addDep()">添加依赖</button>
     </div>
@@ -314,6 +363,11 @@ async function refresh(structure = false) {
     }
   }
 }
+
+$("help").innerHTML = `<h2 style="margin-top:0">依赖指令速查</h2><dl style="margin:0">` +
+  Object.entries(DIR_HELP).map(([d, h]) => `<dt>${d}=</dt><dd>${h}</dd>`).join("") +
+  `</dl><p class="muted" style="margin-bottom:0">经验法则：普通服务用 Wants + After；数据库这类硬前置用 Requires + After；
+   想跟着数据库一起重启再加 PartOf。</p>`;
 
 refresh(true);
 setInterval(() => refresh(false), 4000);
