@@ -49,6 +49,17 @@
   #help { position: fixed; top: 46px; left: 12px; z-index: 15; display: none; max-width: 560px;
           background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
           padding: 12px 16px; box-shadow: 0 8px 30px rgba(0,0,0,.5); }
+  #order { position: fixed; top: 46px; left: 12px; z-index: 15; display: none; max-width: 640px;
+           max-height: calc(100vh - 70px); overflow-y: auto;
+           background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+           padding: 12px 16px; box-shadow: 0 8px 30px rgba(0,0,0,.5); }
+  .batch { display: flex; gap: 6px; align-items: baseline; padding: 6px 0;
+           border-bottom: 1px dashed var(--border); }
+  .batch .no { color: var(--accent); font-weight: 600; white-space: nowrap; width: 52px; }
+  .batch .units { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip { border: 1px solid var(--border); border-radius: 12px; padding: 1px 10px; font-size: 12.5px;
+          cursor: pointer; }
+  .chip.dis { opacity: .45; text-decoration: line-through; }
   #help dt { color: var(--accent); font-weight: 600; margin-top: 8px; }
   #help dd { margin: 2px 0 0 0; color: var(--muted); font-size: 12.5px; }
   .explain { background: #171b21; border-left: 3px solid var(--accent); border-radius: 4px;
@@ -69,6 +80,7 @@
   <button onclick="refresh(true)">刷新</button>
   <button onclick="post('api/daemon-reload').then(r=>toast('daemon-reload: '+(r.ok?'完成':r.error||r.message)))">daemon-reload</button>
   <label class="muted"><input type="checkbox" id="show-net" onchange="draw()" checked> 显示网络分组</label>
+  <button onclick="toggleOrder()" title="按 After/Before 拓扑排序得到的启动批次">🚀 启动顺序</button>
   <button onclick="$('help').style.display = $('help').style.display === 'block' ? 'none' : 'block'" title="依赖指令说明">❓ 指令说明</button>
   <div class="legend">
     <span class="lg-req">Requires/BindsTo</span><span class="lg-partof">PartOf</span>
@@ -85,6 +97,7 @@
     箭头方向 A → B 表示 A 依赖 B（B 先启动）。拖动节点可以整理布局。</p></div>
 </div>
 <div id="help"></div>
+<div id="order"></div>
 <div id="toast"></div>
 
 <script>
@@ -362,6 +375,51 @@ async function refresh(structure = false) {
       $("st-enabled").textContent = n.status && n.status.enabled || "";
     }
   }
+}
+
+// 按 After/Before 做拓扑分层：每一批内并行启动，下一批等上一批全部启动完成
+function startupBatches() {
+  const pred = {};
+  for (const n of GRAPH.nodes) pred[n.id] = new Set();
+  for (const e of GRAPH.edges) {
+    if (e.type === "After") pred[e.from].add(e.to);       // from 等 to 先启动
+    else if (e.type === "Before") pred[e.to].add(e.from); // to 等 from 先启动
+  }
+  const batches = [], placed = new Set();
+  let remaining = GRAPH.nodes.map(n => n.id);
+  while (remaining.length) {
+    const batch = remaining.filter(id => [...pred[id]].every(p => placed.has(p)));
+    if (!batch.length) { batches.push({ cycle: remaining }); break; }
+    batches.push({ batch: batch.sort() });
+    batch.forEach(id => placed.add(id));
+    remaining = remaining.filter(id => !placed.has(id));
+  }
+  return batches;
+}
+
+function chip(id) {
+  const n = nodeOf(id);
+  const disabled = n && n.status && n.status.enabled === "disabled";
+  const name = id.replace(".container", "");
+  return `<span class="chip${disabled ? " dis" : ""}" style="border-color:${stateColor(n && n.status)}"
+    title="${disabled ? "已 disable，开机不会自动启动" : (n && n.status ? n.status.active + "/" + n.status.sub : "")}"
+    onclick="selected='${id}';renderDetail();network&&network.selectNodes(['${id}'])">${name}</span>`;
+}
+
+function toggleOrder() {
+  const el = $("order");
+  if (el.style.display === "block") { el.style.display = "none"; return; }
+  const rows = startupBatches().map((b, i) => b.cycle
+    ? `<div class="batch"><span class="no" style="color:var(--red)">循环!</span><span class="units">
+         ${b.cycle.map(chip).join("")}</span></div>`
+    : `<div class="batch"><span class="no">第 ${i + 1} 批</span><span class="units">
+         ${b.batch.map(chip).join("")}</span></div>`).join("");
+  el.innerHTML = `<h2 style="margin-top:0">开机启动顺序（按 After/Before 拓扑分层）</h2>${rows}
+    <p class="muted" style="margin-bottom:0">同一批内的服务没有先后约束，systemd 会并行启动；
+    下一批等上一批全部启动完成后开始。边框颜色 = 当前运行状态；
+    <span style="text-decoration:line-through">删除线</span> = 已 disable，开机不会自启。
+    注意：Requires/Wants/PartOf 不影响顺序，只有 After/Before 影响。</p>`;
+  el.style.display = "block";
 }
 
 $("help").innerHTML = `<h2 style="margin-top:0">依赖指令速查</h2><dl style="margin:0">` +
