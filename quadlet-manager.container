@@ -1,0 +1,27 @@
+[Unit]
+Description=Quadlet Manager web UI
+After=local-fs.target network-online.target
+Wants=network-online.target
+
+[Container]
+ContainerName=quadlet-manager
+Image=ghcr.io/xiuxiu10201/quadlet-manager:latest
+AutoUpdate=registry
+Environment=TZ=Asia/Shanghai
+Environment=QM_QUADLET_DIR=/etc/containers/systemd
+Environment=QM_LISTEN=0.0.0.0:8600
+PublishPort=127.0.0.1:8600:8600
+# Quadlet 文件目录（需可写才能在界面上改依赖）
+Volume=/etc/containers/systemd:/etc/containers/systemd
+# systemctl 通过宿主机 D-Bus 控制 systemd
+Volume=/run/dbus/system_bus_socket:/run/dbus/system_bus_socket
+# journalctl 读取宿主机日志
+Volume=/var/log/journal:/var/log/journal:ro
+Volume=/etc/machine-id:/etc/machine-id:ro
+
+[Service]
+RestartSec=10s
+Restart=always
+
+[Install]
+WantedBy=multi-user.target default.target

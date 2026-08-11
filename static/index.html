@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Quadlet Manager</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="static/vendor/vis-network.min.js"></script>
+<style>
+  :root {
+    --bg: #14161a; --panel: #1d2026; --border: #2e333b; --fg: #d8dce2;
+    --muted: #8b93a0; --accent: #4d9fff; --green: #3fb96b; --red: #e05555;
+    --yellow: #d9a53c; --gray: #6b7280;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.5 system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+         background: var(--bg); color: var(--fg); display: flex; height: 100vh; overflow: hidden; }
+  #graph { flex: 1; }
+  #sidebar { width: 400px; min-width: 340px; border-left: 1px solid var(--border);
+             background: var(--panel); overflow-y: auto; padding: 14px 16px; }
+  #topbar { position: fixed; top: 0; left: 0; right: 400px; padding: 8px 12px;
+            display: flex; gap: 8px; align-items: center; z-index: 10;
+            background: linear-gradient(to bottom, rgba(20,22,26,.95), rgba(20,22,26,0)); }
+  h1 { font-size: 15px; margin: 0 12px 0 0; }
+  h2 { font-size: 14px; margin: 16px 0 6px; color: var(--accent); }
+  button { background: #262b33; color: var(--fg); border: 1px solid var(--border);
+           border-radius: 6px; padding: 4px 10px; cursor: pointer; font-size: 13px; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: #1c3a5e; border-color: var(--accent); }
+  button.danger { border-color: var(--red); color: var(--red); }
+  select, input, textarea { background: #12151a; color: var(--fg); border: 1px solid var(--border);
+           border-radius: 6px; padding: 4px 8px; font-size: 13px; }
+  textarea { width: 100%; height: 300px; font-family: ui-monospace, monospace; white-space: pre; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; }
+  .b-active { background: rgba(63,185,107,.15); color: var(--green); }
+  .b-failed { background: rgba(224,85,85,.15); color: var(--red); }
+  .b-inactive { background: rgba(107,114,128,.2); color: var(--muted); }
+  .b-other { background: rgba(217,165,60,.15); color: var(--yellow); }
+  .dep-row { display: flex; justify-content: space-between; align-items: center;
+             padding: 3px 0; border-bottom: 1px dashed var(--border); }
+  .dep-row .t { font-family: ui-monospace, monospace; font-size: 12.5px; }
+  .dep-row button { padding: 0 7px; font-size: 12px; }
+  .muted { color: var(--muted); font-size: 12.5px; }
+  .row { display: flex; gap: 6px; margin: 6px 0; flex-wrap: wrap; align-items: center; }
+  #logbox { background: #0d0f12; border: 1px solid var(--border); border-radius: 6px;
+            padding: 8px; font: 11.5px/1.45 ui-monospace, monospace; white-space: pre-wrap;
+            max-height: 260px; overflow-y: auto; }
+  #toast { position: fixed; bottom: 16px; left: 16px; background: #262b33; border: 1px solid var(--border);
+           border-radius: 8px; padding: 8px 14px; display: none; z-index: 20; max-width: 50%; }
+  .legend { display: flex; gap: 14px; font-size: 12px; color: var(--muted); flex-wrap: wrap; }
+  .legend span::before { content: "—— "; font-weight: bold; }
+  .lg-req::before { color: var(--red); } .lg-partof::before { color: #b06fd8; }
+  .lg-wants::before { color: var(--accent); } .lg-after::before { color: var(--gray); }
+  .lg-net::before { color: #3f8f7a; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<div id="topbar">
+  <h1>Quadlet Manager</h1>
+  <button onclick="refresh(true)">刷新</button>
+  <button onclick="post('api/daemon-reload').then(r=>toast('daemon-reload: '+(r.ok?'完成':r.error||r.message)))">daemon-reload</button>
+  <label class="muted"><input type="checkbox" id="show-net" onchange="draw()" checked> 显示网络分组</label>
+  <div class="legend">
+    <span class="lg-req">Requires/BindsTo</span><span class="lg-partof">PartOf</span>
+    <span class="lg-wants">Wants</span><span class="lg-after">After/Before</span><span class="lg-net">网络</span>
+  </div>
+</div>
+<div id="graph"></div>
+<div id="sidebar">
+  <div id="detail"><p class="muted">点击左侧图中的节点查看详情、管理依赖。<br><br>
+    节点颜色：<span class="badge b-active">运行中</span>
+    <span class="badge b-failed">失败</span>
+    <span class="badge b-inactive">已停止</span>
+    <span class="badge b-other">切换中</span><br><br>
+    箭头方向 A → B 表示 A 依赖 B（B 先启动）。拖动节点可以整理布局。</p></div>
+</div>
+<div id="toast"></div>
+
+<script>
+let GRAPH = null, network = null, selected = null;
+const $ = id => document.getElementById(id);
+
+function toast(msg, ms = 3500) {
+  const t = $("toast"); t.textContent = msg; t.style.display = "block";
+  clearTimeout(t._h); t._h = setTimeout(() => t.style.display = "none", ms);
+}
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  try { return await r.json(); } catch { return { ok: false, error: "HTTP " + r.status }; }
+}
+const post = (path, body) => api(path, { method: "POST", headers: {"Content-Type":"application/json"},
+                                         body: JSON.stringify(body || {}) });
+
+function stateColor(st) {
+  if (!st) return "#6b7280";
+  if (st.active === "active") return "#3fb96b";
+  if (st.active === "failed") return "#e05555";
+  if (st.active === "activating" || st.active === "deactivating" || st.active === "reloading") return "#d9a53c";
+  return "#6b7280";
+}
+function stateBadge(st) {
+  const a = st ? st.active : "unknown";
+  const cls = a === "active" ? "b-active" : a === "failed" ? "b-failed"
+            : (a === "inactive" || a === "unknown") ? "b-inactive" : "b-other";
+  return `<span class="badge ${cls}">${a}${st && st.sub ? " / " + st.sub : ""}</span>`;
+}
+
+const EDGE_STYLE = {
+  Requires: { color: "#e05555", dashes: false, width: 2 },
+  BindsTo:  { color: "#e05555", dashes: [2,2], width: 2 },
+  PartOf:   { color: "#b06fd8", dashes: false, width: 2 },
+  Wants:    { color: "#4d9fff", dashes: false, width: 1.5 },
+  After:    { color: "#5b626d", dashes: [6,4], width: 1 },
+  Before:   { color: "#5b626d", dashes: [6,4], width: 1 },
+  Network:  { color: "#3f8f7a", dashes: [1,3], width: 1 },
+};
+
+function draw() {
+  if (!GRAPH) return;
+  const showNet = $("show-net").checked;
+  const nodes = GRAPH.nodes.map(n => ({
+    id: n.id,
+    label: n.id.replace(".container", ""),
+    shape: "box", borderWidth: 2, margin: 8,
+    color: { background: "#1d2026", border: stateColor(n.status),
+             highlight: { background: "#26303c", border: "#4d9fff" } },
+    font: { color: "#d8dce2", size: 14 },
+  }));
+  if (showNet) {
+    for (const net of GRAPH.networks) {
+      nodes.push({ id: net.id, label: net.name === "host" ? "host 网络" : net.name,
+        shape: "hexagon", size: 18,
+        color: { background: "#173029", border: "#3f8f7a" },
+        font: { color: "#7fbfae", size: 12 } });
+    }
+  }
+  // 合并同一对节点之间的平行边，标签合写，样式取最强的依赖类型
+  const PRIORITY = ["BindsTo", "Requires", "PartOf", "Wants", "After", "Before"];
+  const grouped = new Map();
+  for (const e of GRAPH.edges) {
+    const key = e.from + "|" + e.to;
+    if (!grouped.has(key)) grouped.set(key, { from: e.from, to: e.to, types: new Set() });
+    grouped.get(key).types.add(e.type);
+  }
+  const edges = [...grouped.values()].map((g, i) => {
+    const types = PRIORITY.filter(t => g.types.has(t));
+    return {
+      id: "e" + i, from: g.from, to: g.to,
+      arrows: types.every(t => t === "Before") ? "from" : "to",
+      label: types.join("+"),
+      font: { size: 9, color: "#8b93a0", strokeWidth: 4, strokeColor: "#14161a", align: "horizontal" },
+      ...EDGE_STYLE[types[0]],
+      smooth: { type: "curvedCW", roundness: 0.15 },
+    };
+  });
+  if (showNet) {
+    GRAPH.network_edges.forEach((e, i) =>
+      edges.push({ id: "n" + i, from: e.from, to: e.to, ...EDGE_STYLE.Network }));
+  }
+  const data = { nodes: new vis.DataSet(nodes), edges: new vis.DataSet(edges) };
+  if (network) { network.setData(data); return; }
+  network = new vis.Network($("graph"), data, {
+    physics: { solver: "forceAtlas2Based",
+      forceAtlas2Based: { gravitationalConstant: -80, springLength: 130, avoidOverlap: 0.6 },
+      stabilization: { iterations: 200 } },
+    interaction: { hover: true },
+  });
+  network.on("click", p => {
+    const id = p.nodes[0];
+    if (id && !id.startsWith("net:")) { selected = id; renderDetail(); }
+  });
+}
+
+function nodeOf(id) { return GRAPH.nodes.find(n => n.id === id); }
+
+let detailUnit = null; // 上次渲染详情面板的单元，用于决定是否保留输入框内容
+
+function renderDetail() {
+  const n = nodeOf(selected);
+  if (!n) { $("detail").innerHTML = '<p class="muted">该单元已不存在。</p>'; detailUnit = null; return; }
+  // 重渲染同一单元时，先暂存用户已加载/编辑的内容
+  const prev = detailUnit === selected ? {
+    file: $("filebox") ? $("filebox").value : "",
+    log: $("logbox") ? $("logbox").textContent : "",
+    dir: $("dep-dir") ? $("dep-dir").value : null,
+    target: $("dep-target") ? $("dep-target").value : null,
+  } : null;
+  const u = n.unit;
+  const others = GRAPH.nodes.filter(x => x.id !== n.id).map(x => x.unit.service);
+  const depRows = [];
+  for (const [dir, targets] of Object.entries(u.deps)) {
+    for (const t of targets) {
+      depRows.push(`<div class="dep-row"><span class="t">${dir} → ${t}</span>
+        <button class="danger" onclick="removeDep('${dir}','${t}')">删除</button></div>`);
+    }
+  }
+  const dependents = [];
+  for (const other of GRAPH.nodes) {
+    if (other.id === n.id) continue;
+    for (const [dir, targets] of Object.entries(other.unit.deps))
+      if (targets.includes(u.service))
+        dependents.push(`<div class="dep-row"><span class="t">${other.id.replace(".container","")} (${dir})</span></div>`);
+  }
+  $("detail").innerHTML = `
+    <h2 style="margin-top:36px">${u.container_name || n.id}</h2>
+    <div class="muted">${u.description}</div>
+    <div class="row"><span id="st-badge">${stateBadge(n.status)}</span>
+      <span class="muted">${u.service} · <span id="st-enabled">${n.status && n.status.enabled || ""}</span></span></div>
+    <div class="muted" style="word-break:break-all">镜像: ${u.image || "—"}<br>
+      网络: ${u.networks.join(", ") || "—"}</div>
+    <div class="row">
+      <button class="primary" onclick="action('start')">启动</button>
+      <button onclick="action('restart')">重启</button>
+      <button class="danger" onclick="action('stop')">停止</button>
+      <button onclick="action('enable')">enable</button>
+      <button onclick="action('disable')">disable</button>
+    </div>
+    <h2>依赖（本单元 → 其他）</h2>
+    ${depRows.join("") || '<div class="muted">无</div>'}
+    ${n.external_deps.length ? '<div class="muted" style="margin-top:4px">外部: ' + n.external_deps.join("; ") + "</div>" : ""}
+    <div class="row">
+      <select id="dep-dir">${["Requires","Wants","After","Before","BindsTo","PartOf"]
+        .map(d => `<option>${d}</option>`).join("")}</select>
+      <select id="dep-target">${others.map(s => `<option>${s}</option>`).join("")}</select>
+      <button class="primary" onclick="addDep()">添加依赖</button>
+    </div>
+    <h2>被谁依赖（其他 → 本单元）</h2>
+    ${dependents.join("") || '<div class="muted">无</div>'}
+    <h2>日志 <button onclick="loadLogs()" style="font-size:12px">加载最近 80 行</button></h2>
+    <div id="logbox" class="muted">（未加载）</div>
+    <h2>文件编辑 <button onclick="loadFile()" style="font-size:12px">加载</button>
+      <button class="primary" onclick="saveFile()" style="font-size:12px">保存并 reload</button></h2>
+    <textarea id="filebox" spellcheck="false" placeholder="点击“加载”查看 ${n.id}"></textarea>
+    <p class="muted">改依赖后已自动 daemon-reload；要让运行中的容器生效需重启该单元。</p>`;
+  if (prev) {
+    if (prev.file) $("filebox").value = prev.file;
+    if (prev.log && prev.log !== "（未加载）") $("logbox").textContent = prev.log;
+    if (prev.dir) $("dep-dir").value = prev.dir;
+    if (prev.target && others.includes(prev.target)) $("dep-target").value = prev.target;
+  }
+  detailUnit = selected;
+}
+
+async function action(act) {
+  toast(act + " " + selected + " ...", 60000);
+  const r = await post(`api/units/${selected}/action`, { action: act });
+  toast((r.ok ? "完成: " : "失败: ") + (r.message || r.error || act));
+  refresh();
+}
+async function addDep() {
+  const r = await post(`api/units/${selected}/deps`,
+    { op: "add", directive: $("dep-dir").value, target: $("dep-target").value });
+  toast(r.ok ? "已添加，daemon-reload " + (r.daemon_reload ? "完成" : "失败: " + r.reload_message)
+             : "失败: " + (r.error || ""));
+  if (r.ok) detailUnit = null; // 磁盘文件已变，编辑框旧内容作废，避免保存时覆盖改动
+  await refresh(true);
+}
+async function removeDep(dir, target) {
+  const r = await post(`api/units/${selected}/deps`, { op: "remove", directive: dir, target });
+  toast(r.ok ? "已删除，daemon-reload " + (r.daemon_reload ? "完成" : "失败: " + r.reload_message)
+             : "失败: " + (r.error || ""));
+  if (r.ok) detailUnit = null;
+  await refresh(true);
+}
+async function loadLogs() {
+  const r = await api(`api/units/${selected}/logs?lines=80`);
+  const box = $("logbox");
+  box.textContent = r.logs || r.error || "(空)";
+  box.scrollTop = box.scrollHeight;
+}
+async function loadFile() {
+  const r = await api(`api/units/${selected}/file`);
+  $("filebox").value = r.content || ("加载失败: " + (r.error || ""));
+}
+async function saveFile() {
+  const content = $("filebox").value;
+  if (!content.trim()) return toast("内容为空，未保存");
+  const r = await api(`api/units/${selected}/file`,
+    { method: "PUT", headers: {"Content-Type":"application/json"}, body: JSON.stringify({ content }) });
+  toast(r.ok ? "已保存，daemon-reload " + (r.daemon_reload ? "完成" : "失败: " + r.reload_message)
+             : "保存失败: " + (r.error || ""));
+  refresh(true);
+}
+
+async function refresh(structure = false) {
+  if (structure || !GRAPH) {
+    const g = await api("api/graph");
+    if (!g || !g.nodes) { toast("加载失败: " + (g && g.error || "无法访问 /api/graph"), 10000); return; }
+    if (typeof vis === "undefined") {
+      $("graph").innerHTML = '<p style="padding:60px 20px">vis-network 未加载（/static/vendor/vis-network.min.js）</p>';
+      return;
+    }
+    GRAPH = g;
+    draw();
+    if (selected) renderDetail();
+    return;
+  }
+  const statuses = await api("api/status");
+  for (const n of GRAPH.nodes) {
+    const st = statuses[n.unit.service];
+    if (st) n.status = st;
+  }
+  if (network) {
+    network.body.data.nodes.update(GRAPH.nodes.map(n =>
+      ({ id: n.id, color: { background: "#1d2026", border: stateColor(n.status),
+          highlight: { background: "#26303c", border: "#4d9fff" } } })));
+  }
+  // 轮询只原地更新状态徽章，不重建面板（避免清掉编辑框/日志）
+  if (selected) {
+    const n = nodeOf(selected);
+    if (n && $("st-badge")) {
+      $("st-badge").innerHTML = stateBadge(n.status);
+      $("st-enabled").textContent = n.status && n.status.enabled || "";
+    }
+  }
+}
+
+refresh(true);
+setInterval(() => refresh(false), 4000);
+</script>
+</body>
+</html>
