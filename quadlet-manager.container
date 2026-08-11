@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Container]
 ContainerName=quadlet-manager
-Image=ghcr.io/xiuxiu10201/quadlet-manager:latest
+Image=ghcr.io/dream10201/quadlet_manager:latest
 AutoUpdate=registry
 Environment=TZ=Asia/Shanghai
 Environment=QM_QUADLET_DIR=/etc/containers/systemd
